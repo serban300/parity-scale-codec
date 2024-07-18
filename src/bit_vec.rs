@@ -57,7 +57,13 @@ impl<O: BitOrder, T: BitStore + Decode> Decode for BitVec<T, O> {
 			if bits as usize > ARCH32BIT_BITSLICE_MAX_BITS {
 				return Err("Attempt to decode a BitVec with too many bits".into());
 			}
-			let vec = decode_vec_with_len(input, bitvec::mem::elts::<T>(bits as usize))?;
+			let vec = decode_vec_with_len(
+				input,
+				bitvec::mem::elts::<T>(bits as usize),
+				T::TYPE_INFO,
+				|input, _hooks| T::decode(input),
+				&mut (),
+			)?;
 
 			let mut result = Self::try_from_vec(vec).map_err(|_| {
 				Error::from(

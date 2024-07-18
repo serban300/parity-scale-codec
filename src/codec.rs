@@ -280,6 +280,52 @@ pub trait DecodeLength {
 	fn len(self_encoded: &[u8]) -> Result<usize, Error>;
 }
 
+pub trait DecodeHooks {
+	/// Descend into nested reference when decoding.
+	/// This is called when decoding a new refence-based instance,
+	/// such as `Vec` or `Box`. Currently, all such types are
+	/// allocated on the heap.
+	fn on_descend_ref(&mut self) -> Result<(), Error> {
+		Ok(())
+	}
+
+	/// Ascend to previous structure level when decoding.
+	/// This is called when decoding reference-based type is finished.
+	fn on_ascend_ref(&mut self) {}
+
+	fn on_before_alloc_mem(&mut self, size: usize) -> Result<(), Error>;
+}
+
+impl DecodeHooks for () {
+	fn on_before_alloc_mem(&mut self, _size: usize) -> Result<(), Error> {
+		Ok(())
+	}
+}
+
+pub trait DecodeWithHooks: Sized {
+	// !INTERNAL USE ONLY!
+	// This const helps SCALE to optimize the encoding/decoding by doing fake specialization.
+	#[doc(hidden)]
+	const TYPE_INFO: TypeInfo = TypeInfo::Unknown;
+
+	fn decode_with_hooks<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+	) -> Result<Self, Error>;
+
+	fn decode_with_hooks_into<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+		dst: &mut MaybeUninit<Self>,
+	) -> Result<DecodeFinished, Error> {
+		let value = Self::decode_with_hooks(input, hooks)?;
+		dst.write(value);
+
+		// SAFETY: We've written the decoded value to `dst` so calling this is safe.
+		unsafe { Ok(DecodeFinished::assert_decoding_finished()) }
+	}
+}
+
 /// Trait that allows zero-copy read of value-references from slices in LE format.
 pub trait Decode: Sized {
 	// !INTERNAL USE ONLY!
@@ -521,6 +567,80 @@ pub trait WrapperTypeDecode: Sized {
 	}
 }
 
+fn decode_box<
+	T,
+	I: Input,
+	H: DecodeHooks,
+	F: FnMut(&mut I, &mut H, &mut MaybeUninit<T>) -> Result<(), Error>,
+>(
+	input: &mut I,
+	hooks: &mut H,
+	mut decode_item_fn: F,
+) -> Result<Box<T>, Error> {
+	hooks.on_descend_ref()?;
+	input.descend_ref()?;
+
+	// Placement new is not yet stable, but we can just manually allocate a chunk of memory
+	// and convert it to a `Box` ourselves.
+	//
+	// The explicit types here are written out for clarity.
+	//
+	// TODO: Use `Box::new_uninit` once that's stable.
+	let layout = core::alloc::Layout::new::<MaybeUninit<T>>();
+
+	hooks.on_before_alloc_mem(layout.size())?;
+	let ptr: *mut MaybeUninit<T> = if layout.size() == 0 {
+		core::ptr::NonNull::dangling().as_ptr()
+	} else {
+		// SAFETY: Layout has a non-zero size so calling this is safe.
+		let ptr: *mut u8 = unsafe { crate::alloc::alloc::alloc(layout) };
+
+		if ptr.is_null() {
+			crate::alloc::alloc::handle_alloc_error(layout);
+		}
+
+		ptr.cast()
+	};
+
+	// SAFETY: Constructing a `Box` from a piece of memory allocated with `std::alloc::alloc`
+	//         is explicitly allowed as long as it was allocated with the global allocator
+	//         and the memory layout matches.
+	//
+	//         Constructing a `Box` from `NonNull::dangling` is also always safe as long
+	//         as the underlying type is zero-sized.
+	let mut boxed: Box<MaybeUninit<T>> = unsafe { Box::from_raw(ptr) };
+
+	let value = decode_item_fn(input, hooks, &mut boxed)?;
+
+	// Decoding succeeded, so let's get rid of `MaybeUninit`.
+	//
+	// TODO: Use `Box::assume_init` once that's stable.
+	let ptr: *mut MaybeUninit<T> = Box::into_raw(boxed);
+	let ptr: *mut T = ptr.cast();
+
+	// SAFETY: `MaybeUninit` doesn't affect the memory layout, so casting the pointer back
+	//         into a `Box` is safe.
+	let boxed: Box<T> = unsafe { Box::from_raw(ptr) };
+
+	hooks.on_ascend_ref();
+	input.ascend_ref();
+	Ok(boxed)
+}
+
+impl<T> DecodeWithHooks for Box<T>
+where
+	T: DecodeWithHooks,
+{
+	fn decode_with_hooks<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+	) -> Result<Self, Error> {
+		decode_box(input, hooks, |input, hooks, dest| {
+			T::decode_with_hooks_into(input, hooks, dest).map(|_| ())
+		})
+	}
+}
+
 impl<T> WrapperTypeDecode for Box<T> {
 	type Wrapped = T;
 
@@ -528,51 +648,20 @@ impl<T> WrapperTypeDecode for Box<T> {
 	where
 		Self::Wrapped: Decode,
 	{
-		input.descend_ref()?;
+		decode_box(input, &mut (), |input, hooks, dest| T::decode_into(input, dest).map(|_| ()))
+	}
+}
 
-		// Placement new is not yet stable, but we can just manually allocate a chunk of memory
-		// and convert it to a `Box` ourselves.
-		//
-		// The explicit types here are written out for clarity.
-		//
-		// TODO: Use `Box::new_uninit` once that's stable.
-		let layout = core::alloc::Layout::new::<MaybeUninit<T>>();
-
-		let ptr: *mut MaybeUninit<T> = if layout.size() == 0 {
-			core::ptr::NonNull::dangling().as_ptr()
-		} else {
-			// SAFETY: Layout has a non-zero size so calling this is safe.
-			let ptr: *mut u8 = unsafe { crate::alloc::alloc::alloc(layout) };
-
-			if ptr.is_null() {
-				crate::alloc::alloc::handle_alloc_error(layout);
-			}
-
-			ptr.cast()
-		};
-
-		// SAFETY: Constructing a `Box` from a piece of memory allocated with `std::alloc::alloc`
-		//         is explicitly allowed as long as it was allocated with the global allocator
-		//         and the memory layout matches.
-		//
-		//         Constructing a `Box` from `NonNull::dangling` is also always safe as long
-		//         as the underlying type is zero-sized.
-		let mut boxed: Box<MaybeUninit<T>> = unsafe { Box::from_raw(ptr) };
-
-		T::decode_into(input, &mut boxed)?;
-
-		// Decoding succeeded, so let's get rid of `MaybeUninit`.
-		//
-		// TODO: Use `Box::assume_init` once that's stable.
-		let ptr: *mut MaybeUninit<T> = Box::into_raw(boxed);
-		let ptr: *mut T = ptr.cast();
-
-		// SAFETY: `MaybeUninit` doesn't affect the memory layout, so casting the pointer back
-		//         into a `Box` is safe.
-		let boxed: Box<T> = unsafe { Box::from_raw(ptr) };
-
-		input.ascend_ref();
-		Ok(boxed)
+impl<T> DecodeWithHooks for Rc<T>
+where
+	T: DecodeWithHooks,
+{
+	fn decode_with_hooks<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+	) -> Result<Self, Error> {
+		// TODO: This is inefficient; use `Rc::new_uninit` once that's stable.
+		Box::<T>::decode_with_hooks(input, hooks).map(|output| output.into())
 	}
 }
 
@@ -585,6 +674,20 @@ impl<T> WrapperTypeDecode for Rc<T> {
 	{
 		// TODO: This is inefficient; use `Rc::new_uninit` once that's stable.
 		Box::<T>::decode(input).map(|output| output.into())
+	}
+}
+
+#[cfg(target_has_atomic = "ptr")]
+impl<T> DecodeWithHooks for Arc<T>
+where
+	T: DecodeWithHooks,
+{
+	fn decode_with_hooks<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+	) -> Result<Self, Error> {
+		// TODO: This is inefficient; use `Arc::new_uninit` once that's stable.
+		Box::<T>::decode_with_hooks(input, hooks).map(|output| output.into())
 	}
 }
 
@@ -1067,9 +1170,13 @@ impl<T: Encode> Encode for [T] {
 	}
 }
 
-fn decode_vec_chunked<T, F>(len: usize, mut decode_chunk: F) -> Result<Vec<T>, Error>
+fn decode_vec_chunked<T, H: DecodeHooks, F>(
+	len: usize,
+	hooks: &mut H,
+	mut decode_chunk: F,
+) -> Result<Vec<T>, Error>
 where
-	F: FnMut(&mut Vec<T>, usize) -> Result<(), Error>,
+	F: FnMut(&mut Vec<T>, usize, &mut H) -> Result<(), Error>,
 {
 	debug_assert!(MAX_PREALLOCATION >= mem::size_of::<T>(), "Invalid precondition");
 	let chunk_len = MAX_PREALLOCATION / mem::size_of::<T>();
@@ -1078,9 +1185,10 @@ where
 	let mut num_undecoded_items = len;
 	while num_undecoded_items > 0 {
 		let chunk_len = chunk_len.min(num_undecoded_items);
+		hooks.on_before_alloc_mem(chunk_len.saturating_mul(mem::size_of::<T>()))?;
 		decoded_vec.reserve_exact(chunk_len);
 
-		decode_chunk(&mut decoded_vec, chunk_len)?;
+		decode_chunk(&mut decoded_vec, chunk_len, hooks)?;
 
 		num_undecoded_items = num_undecoded_items.saturating_sub(chunk_len);
 	}
@@ -1092,7 +1200,11 @@ where
 ///
 /// The encoding of `T` must be equal to its binary representation, and size of `T` must be less
 /// or equal to [`MAX_PREALLOCATION`].
-fn read_vec_from_u8s<T, I>(input: &mut I, len: usize) -> Result<Vec<T>, Error>
+fn read_vec_from_u8s<T, I, H: DecodeHooks>(
+	input: &mut I,
+	len: usize,
+	hooks: &mut H,
+) -> Result<Vec<T>, Error>
 where
 	T: ToMutByteSlice + Default + Clone,
 	I: Input,
@@ -1108,7 +1220,7 @@ where
 		}
 	}
 
-	decode_vec_chunked(len, |decoded_vec, chunk_len| {
+	decode_vec_chunked(len, hooks, |decoded_vec, chunk_len, hooks| {
 		let decoded_vec_len = decoded_vec.len();
 		let decoded_vec_size = decoded_vec_len * mem::size_of::<T>();
 		unsafe {
@@ -1120,9 +1232,13 @@ where
 	})
 }
 
-fn decode_vec_from_items<T, I>(input: &mut I, len: usize) -> Result<Vec<T>, Error>
+fn decode_vec_from_items<T, I, H: DecodeHooks, F: FnMut(&mut I, &mut H) -> Result<T, Error>>(
+	input: &mut I,
+	len: usize,
+	mut decode_item_fn: F,
+	hooks: &mut H,
+) -> Result<Vec<T>, Error>
 where
-	T: Decode,
 	I: Input,
 {
 	// Check if there is enough data in the input buffer.
@@ -1132,43 +1248,47 @@ where
 		}
 	}
 
-	input.descend_ref()?;
-	let vec = decode_vec_chunked(len, |decoded_vec, chunk_len| {
+	decode_vec_chunked(len, hooks, |decoded_vec, chunk_len, hooks| {
 		for _ in 0..chunk_len {
-			decoded_vec.push(T::decode(input)?);
+			decoded_vec.push(decode_item_fn(input, hooks)?);
 		}
 
 		Ok(())
-	})?;
-	input.ascend_ref();
-
-	Ok(vec)
+	})
 }
 
 /// Decode the vec (without a prepended len).
 ///
 /// This is equivalent to decode all elements one by one, but it is optimized in some
 /// situation.
-pub fn decode_vec_with_len<T: Decode, I: Input>(
+pub fn decode_vec_with_len<
+	T,
+	I: Input,
+	H: DecodeHooks,
+	F: FnMut(&mut I, &mut H) -> Result<T, Error>,
+>(
 	input: &mut I,
 	len: usize,
+	item_type_info: TypeInfo,
+	decode_item_fn: F,
+	hooks: &mut H,
 ) -> Result<Vec<T>, Error> {
 	macro_rules! decode {
 		( $ty:ty, $input:ident, $len:ident ) => {{
 			if cfg!(target_endian = "little") || mem::size_of::<T>() == 1 {
-				let vec = read_vec_from_u8s::<$ty, _>($input, $len)?;
+				let vec = read_vec_from_u8s($input, $len, hooks)?;
 				Ok(unsafe { mem::transmute::<Vec<$ty>, Vec<T>>(vec) })
 			} else {
-				decode_vec_from_items::<T, _>($input, $len)
+				decode_vec_from_items($input, $len, decode_item_fn, hooks)
 			}
 		}};
 	}
 
 	with_type_info! {
-		<T as Decode>::TYPE_INFO,
+		item_type_info,
 		decode(input, len),
 		{
-			decode_vec_from_items::<T, _>(input, len)
+			decode_vec_from_items(input, len, decode_item_fn, hooks)
 		},
 	}
 }
@@ -1178,10 +1298,40 @@ impl<T: EncodeLike<U>, U: Encode> EncodeLike<Vec<U>> for Vec<T> {}
 impl<T: EncodeLike<U>, U: Encode> EncodeLike<&[U]> for Vec<T> {}
 impl<T: EncodeLike<U>, U: Encode> EncodeLike<Vec<U>> for &[T] {}
 
+impl<T: DecodeWithHooks> DecodeWithHooks for Vec<T> {
+	fn decode_with_hooks<I: Input, H: DecodeHooks>(
+		input: &mut I,
+		hooks: &mut H,
+	) -> Result<Self, Error> {
+		let len = <Compact<u32>>::decode(input)?;
+		input.descend_ref()?;
+		hooks.on_descend_ref()?;
+		let vec = decode_vec_with_len(
+			input,
+			len.0 as usize,
+			T::TYPE_INFO,
+			|input, hooks| T::decode_with_hooks(input, hooks),
+			hooks,
+		)?;
+		input.ascend_ref();
+		hooks.on_ascend_ref();
+		Ok(vec)
+	}
+}
+
 impl<T: Decode> Decode for Vec<T> {
 	fn decode<I: Input>(input: &mut I) -> Result<Self, Error> {
-		<Compact<u32>>::decode(input)
-			.and_then(move |Compact(len)| decode_vec_with_len(input, len as usize))
+		let len = <Compact<u32>>::decode(input)?;
+		input.descend_ref()?;
+		let vec = decode_vec_with_len(
+			input,
+			len.0 as usize,
+			T::TYPE_INFO,
+			|input, _hooks| T::decode(input),
+			&mut (),
+		)?;
+		input.ascend_ref();
+		Ok(vec)
 	}
 }
 
